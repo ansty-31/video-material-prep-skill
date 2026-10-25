@@ -1,59 +1,91 @@
 ---
-name: video-text-removal
-description: Use when you must remove burned-in text, subtitles, labels, watermarks, or channel logos from a video while keeping the underlying footage usable — and when you must find and acquire usable stock/news footage in the first place. Covers sourcing (YouTube/Bilibili/CCTV), deciding whether removal is worth attempting, in-place inpainting with LaMa + OCR masks, and GPU upscaling. Also use when a video task needs a quality/crop decision that could shift or distort the composition.
-whenToUse: The user asks to strip text from video, clean up downloaded footage, restore/upscale low-quality video, or collect background video (ocean, campus, aerial, stock) for a deck or film. Read the decision gate below BEFORE running any removal.
+name: video-material-prep
+description: Use when preparing video material for editing — searching the web for usable footage, removing burned-in text/subtitles/logos, and restoring or upscaling weak sources. Covers sourcing across YouTube, Bilibili and CCTV (including what is hard-blocked), deciding whether text removal is even possible, in-place LaMa inpainting with OCR masks, ffmpeg denoise/deblock/sharpen/stabilise/upscale, and normalising a mixed set to one editing-ready delivery spec.
+whenToUse: The user needs footage for a video or deck (ocean, campus, aerial, stock, news, military, B-roll), needs burned-in text gone, needs a low-quality clip made usable, or needs a pile of mixed clips normalised before editing. Read the decision gate before running any removal.
 ---
 
-# Video text removal and footage sourcing
+# Video material prep
 
-## Decision gate — read this first
+Pre-production for editing: **find material → strip text → restore quality → hand off normalised.**
+Output is editing-ready footage plus a manifest, not a finished film.
 
-Burned-in text is only removable when it sits on a **reconstructable background** (sky, water, grass, sand, plain walls, shallow depth-of-field blur). It is **not** removable when it sits on **structured detail** (building facades, crowds, instrument panels, product bodies, text-on-text).
+## Decision gate — before any text removal
+
+Burned-in text is removable only on a **reconstructable background**: sky, water, grass, sand, plain
+wall, bokeh. On **structured detail** — building facades, machinery, crowds, instrument panels — it
+is not, and a full-region mask smears worse than the original text.
 
 | Text sits on | Verdict |
 |---|---|
-| Sky / water / grass / sand / blur | In-place inpaint works well |
-| Building facade, machinery, dense texture | **Do not attempt** — a full-region mask smears worse than the original text |
-| The subject's own body (model numbers, logos) | **Keep it** — removing it damages the subject |
+| Sky / water / grass / sand / blur | In-place inpaint works |
+| Facade / machinery / dense texture | **Do not attempt** — change source instead |
+| The subject's own body (model numbers, plates) | **Keep it** — removal damages the object |
 
-When removal is not viable, the correct move is **to change source, not to try harder**: find official or label-free footage of the same subject. Say so plainly instead of shipping a smeared frame.
+When removal is not viable, the correct move is **to change source, not to try harder**: find
+official or label-free footage of the same subject, and say plainly that the alternatives are
+"keep the labels" or "use different footage".
 
-**Never remove text by cropping a band and stretching back to the original height.** That rescales content ~1.15x and visibly shifts it down/zooms it. Either inpaint in place (geometry untouched) or crop and accept a different aspect ratio — never crop-then-stretch.
+**Never remove text by cropping a band and stretching back to the original height.** That magnifies
+content by `1/(1-crop)` and visibly shifts it. Inpaint in place, or crop and keep the new aspect.
 
-## Pipeline
+## The four stages
+
+### 1. Find
+
+Survey with flat search, shortlist, then fetch metadata per candidate (search results do not carry
+upload dates). Verify resolution with `-F` before downloading. Record source, author and licence for
+every clip as you go — reconstructing it later is expensive.
+
+Prefer official channels → CC-licensed stock → creator-declared free → unknown (label it).
+`reference/sourcing.md` has the commands, the Bilibili search API quirks, CCTV's `guid` flow, and the
+platforms that are hard-blocked.
+
+### 2. Strip text
 
 ```
-probe → transcode to H.264 → locate text (OCR, zone-restricted) → mask → LaMa per frame → encode
+probe → transcode H.264 → OCR (zone-restricted) → mask → LaMa per frame → encode
 ```
 
-1. **Probe first.** `ffprobe` the source. AV1 sources cannot be read by `cv2.VideoCapture` — transcode to H.264 before any frame work.
-2. **Locate text.** EasyOCR (`ch_sim`,`en`) sampled every ~8 frames. Restrict accepted boxes to the overlay zones; otherwise the subject gets damaged — see `reference/pitfalls.md`.
-3. **Mask.** Union of accepted boxes, dilate ~17-21 px. Add a fixed rectangle for a corner logo if present.
-4. **Inpaint.** `simple-lama-inpainting` (big-lama), per frame, GPU.
-5. **Encode.** `libx264 -crf 16-17 -pix_fmt yuv420p -movflags +faststart`; drop audio for background footage.
+`scripts/delogo_text.py <src> <start> <end> <out>` runs the whole thing. Two rules that decide
+success:
 
-Run `scripts/delogo_text.py <src> <start> <end> <out>` to do all five.
+- **Zone-restrict the mask.** Accept OCR boxes only in overlay bands (top/bottom), or the subject gets
+  smeared by false positives. Text belonging to the object stays.
+- **Never mask a full-width band** across structured content — LaMa averages it into fog.
 
-## Expect it to be slow
+Expect ~**28 s of compute per 1 s of 1080p output**. Plan the clip list first.
 
-About **28 seconds of compute per 1 second of 1080p video**. A 12-second clip takes ~5.5 minutes. Plan the clip list before starting; do not discover this after launching 20 clips.
+### 3. Restore
 
-If several agents share one GPU, wrap every GPU command in `flock /tmp/gpu.lock -c '<cmd>'` or they will thrash.
+Order is fixed: `deinterlace → denoise → deblock → upscale → sharpen → colour → encode`.
+Assess from stills before choosing filters. One mild pass beats three aggressive ones.
 
-## Always verify, never assume
+`reference/quality-restoration.md` covers the diagnosis table, filter parameters for each stage, the
+Real-ESRGAN ncnn-Vulkan setup that works on Python 3.13, and stabilise/deflicker two-pass recipes.
 
-After processing, extract 3-4 frames from the **output** and look at them. Check three things: text gone, subject undamaged, no band seams. A run that "completed" proves nothing — a wrongly inverted mask threshold produces a clean-looking encode with all the text still there.
+### 4. Hand off
 
-Also check for `moov atom not found` — it means a file is still being written or was truncated.
+Normalise the whole set to one spec — 1920x1080, single frame rate, H.264 CRF 16, `yuv420p`,
+`-an`, `+faststart` — with `pad` (never stretch) and `setsar=1`. Number filenames in the order the
+editor will reach for them. Ship a `说明.md` manifest and a contact sheet.
 
-## Sourcing
+`reference/editing-prep.md` has the exact command, the manifest columns, contact-sheet script, and
+the recurring judgment calls (trim the head; check for a cut inside the clip; keep a clean master).
 
-Prefer, in order: official channels → CC-licensed stock → creator-declared free footage → anything else (label clearly). For each clip record source URL, author, license, resolution. See `reference/sourcing.md` for the concrete commands (yt-dlp patterns, Bilibili search API, CCTV guid extraction, and what is hard-blocked).
+## Verify, never assume
+
+After any stage, extract frames from the **output** and look at them. A run that "completed" proves
+nothing — an inverted mask threshold yields a clean-looking encode with all the text still present.
+
+Also treat `moov atom not found` as "file still being written", not as a retryable error.
 
 ## References
 
-- `reference/pipeline.md` — exact parameters, OCR zone config, mask/encode settings
-- `reference/pitfalls.md` — every failure mode hit in practice, with symptom → cause → fix
-- `reference/sourcing.md` — acquisition commands and platform quirks
-- `scripts/delogo_text.py` — the working pipeline
-- `scripts/setup.sh` — dependency install that actually succeeds on Python 3.13
+- `reference/sourcing.md` — search/extract commands per platform, hard blocks, verification
+- `reference/quality-restoration.md` — diagnosis, per-stage filters, upscaling, stabilise
+- `reference/editing-prep.md` — delivery spec, naming, manifest, contact sheet
+- `reference/pipeline.md` — text-removal parameters, zone config, throughput
+- `reference/pitfalls.md` — every failure mode hit in practice: symptom → cause → fix
+- `scripts/delogo_text.py` — text-removal pipeline (CLI)
+- `scripts/normalize.sh` — batch normalise a folder to the delivery spec
+- `scripts/setup.sh` — dependency install that succeeds on Python 3.13
